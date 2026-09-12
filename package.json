@@ -1,0 +1,9 @@
+{
+  "name": "approval-flow-kit",
+  "version": "1.0.0",
+  "description": "業種を設定ファイルで切り替える、汎用の多段承認フロー基盤",
+  "main": "app.js",
+  "scripts": { "start": "node app.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.19.2" }
+}
