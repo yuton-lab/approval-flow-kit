@@ -103,16 +103,21 @@ const tpl = () => TEMPLATES[DB.config.tpl];
 /* メンバーは役割から機械的に用意する。テンプレートに人名を書かせない作り。
  * 業種を足す人が考えるのは「どんな役割が要るか」だけで済む。 */
 const NAME_POOL = ["佐藤", "鈴木", "高橋", "田中", "伊藤", "渡辺", "山本", "中村"];
+// 名前に役割を含めない。画面のほとんどが役割名と並べて出すので、
+// 名前側にも入れると「工事部長(高橋(工事部長))」のように二重になる
 function membersOf(id) {
   if (!DB.members[id]) {
     DB.members[id] = (TEMPLATES[id].roles || []).map((role, i) => ({
-      id: `${id}-${i + 1}`, name: `${NAME_POOL[i % NAME_POOL.length]}(${role})`, role,
+      id: `${id}-${i + 1}`, name: NAME_POOL[i % NAME_POOL.length], role,
     }));
-    DB.members[id].push({ id: `${id}-0`, name: "山田(申請者)", role: "__applicant__" });
+    DB.members[id].push({ id: `${id}-0`, name: "山田", role: "__applicant__" });
     save("members");
   }
   return DB.members[id];
 }
+// 人を指すときは「名前(役割)」。役割名の隣に出す場面では name だけを使う
+const roleLabel = (m) => (m.role === "__applicant__" ? "申請者" : m.role);
+const whoLabel = (m) => `${m.name}(${roleLabel(m)})`;
 const memberById = (id) => membersOf(DB.config.tpl).find(m => m.id === id) || null;
 const applicantOf = (id) => membersOf(id).find(m => m.role === "__applicant__");
 
@@ -573,7 +578,7 @@ app.post("/apply/:secret", (req, res) => {
 function userSwitch(path, me) {
   const list = membersOf(DB.config.tpl);
   return `<p class="hint">👤 ユーザー切替: ` + list.map(m =>
-    `<a href="${path}?me=${encodeURIComponent(m.id)}" ${m.id === (me && me.id) ? 'style="font-weight:700"' : ""}>${esc(m.name)}</a>`
+    `<a href="${path}?me=${encodeURIComponent(m.id)}" ${m.id === (me && me.id) ? 'style="font-weight:700"' : ""}>${esc(whoLabel(m))}</a>`
   ).join('<span class="sep"></span>') + `</p>`;
 }
 
@@ -585,7 +590,7 @@ app.get("/queue/:secret", (req, res) => {
   const body = mine.length ? mine.map(r => `
 <div class="rec act">
   <div class="top"><b style="color:var(--red)">【${esc(r.route.steps[r.idx])}の番】</b>
-    <span class="mono">申請:${esc(r.applicant)} / ${esc(stamp(r.createdAt))}</span></div>
+    <span class="mono">申請:${esc(r.applicant)}(申請者) / ${esc(stamp(r.createdAt))}</span></div>
   <b style="font-size:15.5px">${esc(r.subject)} × ${esc(r.counterparty)}</b>
   ${(r.checksAtSubmit || []).length ? `<div><span class="badge b-amber">△ 形式チェックの指摘 ${r.checksAtSubmit.length}件</span></div>` : `<div><span class="badge b-green">✓ 形式チェックは通過</span></div>`}
   ${r.returned ? `<div class="note">↩ ${esc(r.returned.from)}(${esc(r.returned.by)})から差し戻し: ${esc(r.returned.comment) || "(コメントなし)"}</div>` : ""}
