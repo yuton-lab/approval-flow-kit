@@ -228,18 +228,30 @@ function decideRoute(t, data) {
  */
 const nowIso = () => new Date().toISOString();
 const stamp = (d) => new Date(d).toLocaleString("ja-JP", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+function buildRequest(t, data, applicantName, at) {
+  const ts = at || nowIso();
+  return {
+    id: nextId(), tpl: t.id, ...data, route: decideRoute(t, data), idx: 0, state: "pending", seals: [],
+    applicant: applicantName, createdAt: ts,
+    history: [{ at: ts, by: applicantName, role: "申請者", action: "submit", comment: "" }],
+    checksAtSubmit: runChecks(data.body, t.checks), returned: null,
+  };
+}
+
 const nextId = () => "R-" + String(DB.reqs.length + 1).padStart(3, "0") + "-" + Math.random().toString(36).slice(2, 5);
 
 function currentStep(r) { return r.state === "pending" ? r.route.steps[r.idx] : null; }
 function canAct(r, m) { return !!m && r.state === "pending" && m.role === currentStep(r); }
 
-function act(r, m, action, comment) {
-  const rec = { at: nowIso(), by: m.name, role: m.role, action, comment: String(comment || "").trim() };
+// at を渡せるのは初期データを過去日で組み立てるため。通常の操作では省略する
+function act(r, m, action, comment, at) {
+  const ts = at || nowIso();
+  const rec = { at: ts, by: m.name, role: m.role, action, comment: String(comment || "").trim() };
   r.seals = r.seals || [];
   if (action === "approve") {
     r.seals[r.idx] = m.name;           // 押した印は工程の位置に残す
     r.idx += 1;
-    if (r.idx >= r.route.steps.length) { r.state = "approved"; r.doneAt = nowIso(); }
+    if (r.idx >= r.route.steps.length) { r.state = "approved"; r.doneAt = ts; }
     r.returned = null;
   } else if (action === "reject") {
     r.returned = { from: r.route.steps[r.idx], by: m.name, comment: rec.comment };
@@ -249,18 +261,31 @@ function act(r, m, action, comment) {
   }
   r.history.push(rec);
   save("reqs", "requests");
-  notify(r, action, m);
+  notify(r, action, m, ts);
   return r;
 }
 
+/* 「いつからこの工程で止まっているか」。
+ * 申請日ではなく、最後に誰かが動かした時点から数える。差し戻しで戻った案件を
+ * 申請日から数えると、実際より長く滞留しているように見えてしまうため。 */
+const DAY = 86400000;
+function stuckSince(r) {
+  const last = r.history[r.history.length - 1];
+  return new Date((last && last.at) || r.createdAt).getTime();
+}
+const stuckDays = (r) => (Date.now() - stuckSince(r)) / DAY;
+const slaOf = (t) => Number((t && t.slaDays) || 3);
+const isOverdue = (r, t) => r.state === "pending" && stuckDays(r) > slaOf(t);
+const fmtDays = (d) => d < 1 ? `${Math.max(1, Math.round(d * 24))}時間` : `${Math.floor(d)}日`;
+
 /* ===== 通知(Slack Webhook が無ければアプリ内の通知ボックスへ) ===== */
-function notify(r, action, m) {
+function notify(r, action, m, at) {
   const t = TEMPLATES[r.tpl] || tpl();
-  const label = { submit: "申請", approve: "承認", reject: "差し戻し", resubmit: "再申請", withdraw: "取り下げ" }[action] || action;
+  const label = { submit: "申請", approve: "承認", reject: "差し戻し", resubmit: "再申請", withdraw: "取り下げ", nudge: "催促" }[action] || action;
   const to = r.state === "pending" ? `次は ${currentStep(r)}` : r.state === "approved" ? "完了" : r.state === "returned" ? "申請者へ差し戻し" : r.state;
   const text = `【${t.terms.request}】${label}: ${r.subject} × ${r.counterparty}(${m ? m.name : "-"}) → ${to}`;
   const link = (BASE_URL ? BASE_URL : "") + `/my/${APP_SECRET}`;
-  DB.inbox.unshift({ at: nowIso(), text, link, id: r.id });
+  DB.inbox.unshift({ at: at || nowIso(), text, link, id: r.id });
   DB.inbox = DB.inbox.slice(0, 100);
   save("inbox");
   if (!SLACK_WEBHOOK_URL) return;
@@ -417,8 +442,10 @@ app.get("/", (req, res) => {
 <span>ユーザーを切り替えると「その人の番」の案件だけが並びます</span></span></a>
 <a class="entry" href="/my/${S()}"><span class="n">3</span><span><b>申請状況</b>
 <span>いま誰で止まっているかを見ます。済んだ工程には承認者の印が押されます</span></span></a>
-<a class="entry" href="/template/${S()}"><span class="n">4</span><span><b>テンプレートの中身</b>
-<span>上の3画面を動かしているJSONそのものです。ここが業種ごとの差分の全部です</span></span></a>
+<a class="entry" href="/stuck/${S()}"><span class="n">4</span><span><b>どこで止まっているか</b>
+<span>工程ごとの滞留と、差し戻しがどこで起きているかが出ます</span></span></a>
+<a class="entry" href="/template/${S()}"><span class="n">5</span><span><b>テンプレートの中身</b>
+<span>上の4画面を動かしているJSONそのものです。ここが業種ごとの差分の全部です</span></span></a>
 
 <h3>差し戻しは「否決」ではありません</h3>
 <p class="hint">差し戻すと、ひとつ前の工程に戻ります。実務では差し戻しの多くが「直せば通る」ものなので、
@@ -510,7 +537,7 @@ app.get("/apply/:secret", (req, res) => {
 <script>
 const $=(id)=>document.getElementById(id);
 const FIELD_KEYS=${JSON.stringify((t.fields || []).map(f => f.key))};
-const SAMPLE=${JSON.stringify(t.sample || null)};
+const SAMPLE=${JSON.stringify((t.samples || [])[0] || null)};
 function payload(){
  const fields={}; FIELD_KEYS.forEach(k=>fields[k]=$('f_'+k)?$('f_'+k).value:'');
  return {subject:$('subject').value,counterparty:$('counterparty').value,body:$('body').value,fields:fields};
@@ -563,13 +590,8 @@ app.post("/apply/:secret", (req, res) => {
     fields,
   };
   if (!data.subject || !data.body) return res.status(400).send(page("入力が足りません", "<h1>入力が足りません</h1><p><a href=\"/apply/" + S() + "\">戻る</a></p>"));
-  const route = decideRoute(t, data);
   const me = applicantOf(t.id);
-  const r = {
-    id: nextId(), tpl: t.id, ...data, route, idx: 0, state: "pending",
-    applicant: me.name, createdAt: nowIso(), history: [{ at: nowIso(), by: me.name, role: "申請者", action: "submit", comment: "" }],
-    checksAtSubmit: runChecks(data.body, t.checks), returned: null,
-  };
+  const r = buildRequest(t, data, me.name);
   DB.reqs.unshift(r);
   save("reqs", "requests");
   notify(r, "submit", me);
@@ -614,7 +636,7 @@ app.get("/queue/:secret", (req, res) => {
 ${userSwitch("/queue/" + S(), me)}
 <p class="hint">同じ案件でも、誰で見るかによって並ぶものが変わります。承認ルートは申請時に決まっています。</p>
 ${body}
-`, [["/queue/" + S() + "?me=" + encodeURIComponent(me.id), "更新"], ["/my/" + S(), "申請状況"], ["/apply/" + S(), "新規申請"], ["/", "トップ"]]));
+`, [["/queue/" + S() + "?me=" + encodeURIComponent(me.id), "更新"], ["/my/" + S(), "申請状況"], ["/stuck/" + S(), "どこで止まっているか"], ["/apply/" + S(), "新規申請"], ["/", "トップ"]]));
 });
 
 app.post("/queue/:secret/act", (req, res) => {
@@ -680,7 +702,7 @@ app.get("/my/:secret", (req, res) => {
 <h2>申請状況(${mine.length}件)</h2>
 <p class="hint">済んだ工程には承認者の印が押されます。丸に番号が付いているのが、いま止まっている工程です。</p>
 ${body}
-`, [["/my/" + S(), "更新"], ["/queue/" + S(), "承認待ち一覧"], ["/apply/" + S(), "新規申請"], ["/inbox/" + S(), "通知ボックス"], ["/", "トップ"]]));
+`, [["/my/" + S(), "更新"], ["/queue/" + S(), "承認待ち一覧"], ["/stuck/" + S(), "どこで止まっているか"], ["/apply/" + S(), "新規申請"], ["/inbox/" + S(), "通知ボックス"], ["/", "トップ"]]));
 });
 
 app.post("/my/:secret/back", (req, res) => {
@@ -700,6 +722,108 @@ app.post("/my/:secret/back", (req, res) => {
   res.redirect(`/my/${S()}?hl=${encodeURIComponent(r.id)}`);
 });
 
+/* ================= 詰まりが見える画面 =================
+ * 承認フローを入れる目的は、電子化そのものではなく「止まるのを減らす」ことにある。
+ * そこで、いま何がどこで何日止まっているかと、どの工程で差し戻しが起きているかを出す。
+ *
+ * 差し戻しの発生元を見せているのは、そこが遅い工程だからではなく、
+ * その「手前」の書き方に問題があるというサインだから。原因は一段前にある。
+ */
+app.get("/stuck/:secret", (req, res) => {
+  if (!guard(req, res)) return;
+  const t = tpl();
+  const sla = slaOf(t);
+  const mine = DB.reqs.filter(r => r.tpl === t.id);
+  const pending = mine.filter(r => r.state === "pending").sort((a, b) => stuckSince(a) - stuckSince(b));
+  const overdue = pending.filter(r => isOverdue(r, t));
+  const done = mine.filter(r => r.state === "approved" && r.doneAt);
+  const avgDone = done.length
+    ? done.reduce((n, r) => n + (new Date(r.doneAt) - new Date(r.createdAt)) / DAY, 0) / done.length : null;
+
+  // 工程ごとの滞留と、その工程が出した差し戻しの回数
+  const per = new Map();
+  for (const role of t.roles || []) per.set(role, { role, n: 0, days: 0, rejects: 0, last: "" });
+  for (const r of pending) {
+    const st = r.route.steps[r.idx];
+    if (!per.has(st)) per.set(st, { role: st, n: 0, days: 0, rejects: 0, last: "" });
+    const x = per.get(st); x.n += 1; x.days += stuckDays(r);
+  }
+  for (const r of mine) for (const h of r.history) {
+    if (h.action !== "reject") continue;
+    if (!per.has(h.role)) per.set(h.role, { role: h.role, n: 0, days: 0, rejects: 0, last: "" });
+    const x = per.get(h.role); x.rejects += 1; if (h.comment) x.last = h.comment;
+  }
+  const rows = [...per.values()].filter(x => x.n || x.rejects);
+
+  const summary = `
+<div class="row" style="margin:0 0 6px">
+  <div class="rec ${overdue.length ? "act" : "done"}" style="margin:0">
+    <span class="mono">止まっている</span>
+    <b style="font-size:27px">${pending.length}件</b>
+    <span class="hint" style="margin:0">うち ${overdue.length}件 が ${sla}日 を超えています</span></div>
+  <div class="rec" style="margin:0">
+    <span class="mono">完了までの平均</span>
+    <b style="font-size:27px">${avgDone == null ? "—" : fmtDays(avgDone)}</b>
+    <span class="hint" style="margin:0">${done.length}件の実績から</span></div>
+  <div class="rec" style="margin:0">
+    <span class="mono">この業種の目安</span>
+    <b style="font-size:27px">${sla}日</b>
+    <span class="hint" style="margin:0">テンプレートの slaDays で設定します</span></div>
+</div>`;
+
+  const list = pending.length ? `<table>
+  <tr><th>件名</th><th>いまの工程</th><th>止まっている</th><th></th></tr>
+  ${pending.map(r => {
+    const od = isOverdue(r, t);
+    return `<tr>
+      <td><b>${esc(r.subject)}</b><br><span class="hint" style="margin:0">${esc(r.counterparty)}</span></td>
+      <td>${esc(r.route.steps[r.idx])}</td>
+      <td class="mono" style="color:${od ? "var(--red)" : "var(--sub)"};font-weight:${od ? 700 : 400}">
+        ${esc(fmtDays(stuckDays(r)))}${od ? " ⚠" : ""}</td>
+      <td>${r.nudgedAt
+        ? `<span class="badge b-brand">催促済み</span>`
+        : `<form method="post" action="/stuck/${S()}/nudge" style="margin:0">
+             <input type="hidden" name="id" value="${esc(r.id)}">
+             <button class="quiet" style="padding:6px 14px;font-size:13px">催促する</button></form>`}</td>
+    </tr>`;
+  }).join("")}</table>` : `<p class="hint">止まっている案件はありません。</p>`;
+
+  const table = rows.length ? `<table>
+  <tr><th>工程</th><th>滞留中</th><th>平均</th><th>差し戻した回数</th><th>直近の差し戻し理由</th></tr>
+  ${rows.map(x => `<tr>
+    <td><b>${esc(x.role)}</b></td>
+    <td class="mono">${x.n}件</td>
+    <td class="mono">${x.n ? esc(fmtDays(x.days / x.n)) : "—"}</td>
+    <td class="mono" style="color:${x.rejects ? "var(--red)" : "var(--sub)"}">${x.rejects}回</td>
+    <td class="hint" style="margin:0">${esc(x.last) || "—"}</td></tr>`).join("")}</table>` : "";
+
+  res.send(page("詰まり", `
+<h2>どこで止まっているか</h2>
+<p class="hint">承認フローを入れる目的は、電子化そのものではなく、止まるのを減らすことです。この画面がその答え合わせになります。</p>
+${summary}
+
+<h3>いま止まっている案件</h3>
+<p class="hint">止まっている時間が長い順です。${sla}日を超えたものに ⚠ が付きます。</p>
+${list}
+
+<h3>工程ごとの状況</h3>
+<p class="hint">差し戻しが多い工程は、その工程が遅いのではなく、<b>ひとつ手前の書き方に問題がある</b>というサインです。原因は一段前にあります。</p>
+${table}
+`, [["/stuck/" + S(), "更新"], ["/queue/" + S(), "承認待ち一覧"], ["/my/" + S(), "申請状況"], ["/", "トップ"]]));
+});
+
+app.post("/stuck/:secret/nudge", (req, res) => {
+  if (!guard(req, res)) return;
+  const r = DB.reqs.find(x => x.id === String(req.body.id || ""));
+  if (r && r.state === "pending") {
+    r.nudgedAt = nowIso();
+    save("reqs", "requests");
+    // 催促は通知として残す。口頭で急かすと記録が残らず、同じ催促が繰り返される
+    notify(r, "nudge", { name: applicantOf(r.tpl).name, role: "申請者" });
+  }
+  res.redirect(`/stuck/${S()}`);
+});
+
 /* ================= 通知ボックス ================= */
 app.get("/inbox/:secret", (req, res) => {
   if (!guard(req, res)) return;
@@ -713,21 +837,63 @@ ${DB.inbox.length ? DB.inbox.map(n => `<div class="rec"><div class="top"><span>$
 `, [["/inbox/" + S(), "更新"], ["/my/" + S(), "申請状況"], ["/", "トップ"]]));
 });
 
-/* ===== デモ用の初期データ ===== */
+/* ===== デモ用の初期データ =====
+ * 全業種ぶんを入れる。業種を切り替えた先が空だと、切り替えられること自体が伝わらないため。
+ * 時刻を過去にずらしているのは、滞留の日数が出ないと「詰まりが見える」画面が意味を持たないため。 */
+const REJECT_REASON = {
+  construction: "足場の分離発注先と、保安要員の手配先が未記載です。決まり次第追記してください。",
+  manufacturing: "強度計算の根拠が添付されていません。安全率の数値だけでは判断できません。",
+  care: "ご本人の意向は書かれていますが、ご家族と合意が取れているかが読み取れません。担当者会議の記録を添えてください。",
+  agency: "No.1表示の根拠となる調査の出典が必要です。調査年と対象を明記してください。",
+  recruiting: "実績を裏付ける数字が足りません。担当件数か達成率を追記してください。",
+};
+
 if (!DB.reqs.length) {
-  for (const id of TPL_IDS) membersOf(id);
-  const t = TEMPLATES[DB.config.tpl];
-  if (t.sample) {
-    const data = { subject: t.sample.subject, counterparty: t.sample.counterparty, body: t.sample.body, fields: t.sample.fields || {} };
-    const route = decideRoute(t, data);
-    DB.reqs.push({
-      id: nextId(), tpl: t.id, ...data, route, idx: 0, state: "pending", seals: [],
-      applicant: applicantOf(t.id).name, createdAt: nowIso(),
-      history: [{ at: nowIso(), by: applicantOf(t.id).name, role: "申請者", action: "submit", comment: "" }],
-      checksAtSubmit: runChecks(data.body, t.checks), returned: null,
-    });
-    save("reqs", "requests");
+  const ago = (d) => new Date(Date.now() - d * DAY).toISOString();
+  for (const id of TPL_IDS) {
+    const t = TEMPLATES[id];
+    const ms = membersOf(id);
+    const applicant = applicantOf(id);
+    const byRole = (role) => ms.find(m => m.role === role);
+    const samples = t.samples || [];
+    const sla = slaOf(t);
+    const pick = (i) => {
+      const x = samples[i];
+      return x && { subject: x.subject, counterparty: x.counterparty, body: x.body, fields: x.fields || {} };
+    };
+
+    // ① 全工程を通って完了したもの
+    const a = pick(0);
+    if (a) {
+      const r = buildRequest(t, a, applicant.name, ago(sla + 6));
+      DB.reqs.push(r);
+      r.route.steps.forEach((step, i) => {
+        const m = byRole(step);
+        if (m && r.state === "pending") act(r, m, "approve", "", ago(sla + 5 - i * 0.6));
+      });
+    }
+
+    // ② 差し戻されて、前の工程で止まっているもの(期限超過)
+    const b = pick(1);
+    if (b) {
+      const r = buildRequest(t, b, applicant.name, ago(sla + 4));
+      DB.reqs.push(r);
+      const first = byRole(r.route.steps[0]);
+      const second = byRole(r.route.steps[1]);
+      if (first) act(r, first, "approve", "", ago(sla + 3.5));
+      if (second) act(r, second, "reject", REJECT_REASON[id] || "追記をお願いします。", ago(sla + 2));
+    }
+
+    // ③ 出したばかりのもの
+    const c = pick(2);
+    if (c) DB.reqs.push(buildRequest(t, c, applicant.name, ago(0.25)));
   }
+  DB.reqs.sort((x, y) => new Date(y.createdAt) - new Date(x.createdAt));
+  DB.inbox.sort((x, y) => new Date(y.at) - new Date(x.at));
+  DB.inbox = DB.inbox.slice(0, 100);
+  save("reqs", "requests");
+  save("inbox");
+  console.log(`[info] デモ用の初期データを ${DB.reqs.length} 件つくりました`);
 }
 
 app.listen(PORT, () => console.log(`[info] http://localhost:${PORT}/ で起動しました(合言葉: ${APP_SECRET})`));
