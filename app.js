@@ -78,7 +78,9 @@ const DB = {
   reqs: readJson("requests", []),
   members: readJson("members", {}),   // テンプレートID -> [{id,name,role}]
   inbox: readJson("inbox", []),
-  config: readJson("config", { tpl: "recruiting" }),
+  // 起動時に表示する業種。保存先が消える環境(Renderの無料プランなど)では、
+  // スリープや再デプロイのたびにこの既定値に戻る。最初に見せたい業種を置く。
+  config: readJson("config", { tpl: process.env.DEFAULT_TEMPLATE || "construction" }),
 };
 const save = (k, n) => writeJson(n || k, DB[k]);
 
